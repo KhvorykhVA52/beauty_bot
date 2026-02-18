@@ -1,0 +1,23 @@
+# База данных
+*.db
+*.db-journal
+beauty_bot.db
+
+# Папки с кэшем Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Переменные окружения (токены, пароли)
+.env
+
+# Файлы Excel (экспорты)
+*.xlsx
+
+# Логи
+*.log
+
+# Настройки VS Code
+.vscode/
+.idea/
