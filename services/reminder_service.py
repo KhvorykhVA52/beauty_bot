@@ -1,109 +1,118 @@
-import time
 import threading
-from datetime import datetime
-from core.database import (
-    get_pending_bookings_for_reminder, 
-    mark_reminder_sent,
-    confirm_booking
-)
+import time
+from datetime import datetime, timedelta
+from core.database import get_connection, mark_reminder_sent
 from telebot import types
+
 
 class ReminderService:
     def __init__(self, bot):
         self.bot = bot
-        self.running = True
-        
+        self.running = False
+
     def start(self):
-        """Запуск сервиса напоминаний в отдельном потоке"""
-        thread = threading.Thread(target=self._run)
-        thread.daemon = True
+        self.running = True
+        thread = threading.Thread(target=self._run, daemon=True)
         thread.start()
         print("✅ Сервис напоминаний запущен")
-    
+
+    def stop(self):
+        self.running = False
+
     def _run(self):
-        """Основной цикл проверки напоминаний"""
         while self.running:
             try:
-                # Проверка напоминаний за 24 часа
-                self._check_reminders(24)
-                
-                # Проверка напоминаний за 1 час
-                self._check_reminders(1)
-                
-                # Проверка каждые 60 секунд
-                time.sleep(60)
-                
+                self._check_reminders()
             except Exception as e:
-                print(f"❌ Ошибка в сервисе напоминаний: {e}")
-                time.sleep(60)
-    
-    def _check_reminders(self, hours_before):
-        """Проверка и отправка напоминаний"""
-        bookings = get_pending_bookings_for_reminder(hours_before)
-        
+                print(f"❌ Критическая ошибка сервиса напоминаний: {e}")
+            time.sleep(60)  # каждую минуту — не пропустим ни одно окно
+
+    def _check_reminders(self):
+        now = datetime.now()
+        print(f"⏰ Проверка напоминаний: {now.strftime('%d.%m.%Y %H:%M')}")
+
+        conn = get_connection()
+        cursor = conn.cursor()
+        # Берём все записи которые ещё не отменены
+        cursor.execute("""
+            SELECT id, telegram_id, service, date, time, name,
+                   reminder_24h_sent, reminder_1h_sent
+            FROM bookings
+            WHERE status != 'cancelled'
+        """)
+        bookings = cursor.fetchall()
+        conn.close()
+
         for booking in bookings:
-            booking_id, telegram_id, service, date, time, name = booking
-            
-            if hours_before == 24:
-                self._send_24h_reminder(telegram_id, booking_id, service, date, time, name)
-            else:
-                self._send_1h_reminder(telegram_id, booking_id, service, date, time, name)
-    
-    def _send_24h_reminder(self, chat_id, booking_id, service, date, time, name):
-        """Отправка напоминания за 24 часа"""
+            booking_id, telegram_id, service, date, time_str, name, sent_24h, sent_1h = booking
+
+            try:
+                booking_dt = datetime.strptime(f"{date} {time_str}", "%d.%m.%Y %H:%M")
+            except ValueError:
+                print(f"⚠️ Неверный формат даты у записи #{booking_id}: '{date} {time_str}'")
+                continue
+
+            # Пропускаем прошедшие записи
+            if booking_dt < now:
+                continue
+
+            # Считаем сколько минут до визита
+            minutes_left = (booking_dt - now).total_seconds() / 60
+
+            # ── Напоминание за 24 часа ───────────────────────────────────
+            # Широкое окно: 23ч 30мин — 24ч 30мин (60 минут ширина)
+            # Проверка каждую минуту = 100% попадание в окно
+            if not sent_24h and (23 * 60 + 30) <= minutes_left <= (24 * 60 + 30):
+                self._send_24h(telegram_id, booking_id, service, date, time_str, name)
+
+            # ── Напоминание за 1 час ─────────────────────────────────────
+            # Широкое окно: 50 — 70 минут (20 минут ширина)
+            elif not sent_1h and 50 <= minutes_left <= 70:
+                self._send_1h(telegram_id, booking_id, service, date, time_str, name)
+
+    # ─────────────────────────────────────────────────────────────────────
+    def _send_24h(self, telegram_id, booking_id, service, date, time_str, name):
         markup = types.InlineKeyboardMarkup()
-        markup.add(
-            types.InlineKeyboardButton("✅ Подтверждаю", callback_data=f"confirm_{booking_id}"),
-            types.InlineKeyboardButton("❌ Отменить", callback_data=f"cancel_{booking_id}")
+        markup.row(
+            types.InlineKeyboardButton("✅ Подтверждаю",      callback_data=f"confirm_{booking_id}"),
+            types.InlineKeyboardButton("❌ Отменить запись",  callback_data=f"cancel_{booking_id}")
         )
-        
+
         text = (
-            f"👋 *Здравствуйте, {name}!*\n\n"
-            f"⏰ *Напоминание о записи*\n"
-            f"Через 24 часа, {date} в {time}, у вас запланирована услуга:\n"
-            f"💅 *{service}*\n\n"
-            f"Пожалуйста, подтвердите, что вы придёте:\n"
-            f"✅ *Подтверждаю* — я буду точно\n"
-            f"❌ *Отменить* — не смогу прийти"
+            f"🔔 *Напоминание о завтрашнем визите*\n\n"
+            f"Привет, {name}!\n\n"
+            f"✂️ *Услуга:* {service}\n"
+            f"📅 *Дата:* {date}\n"
+            f"🕒 *Время:* {time_str}\n\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"Пожалуйста, нажмите одну из кнопок ниже 👇\n\n"
+            f"✅ *Подтверждаю* — буду, всё по плану\n"
+            f"❌ *Отменить* — планы изменились"
         )
-        
+
         try:
-            self.bot.send_message(
-                chat_id,
-                text,
-                parse_mode="Markdown",
-                reply_markup=markup
-            )
-            mark_reminder_sent(booking_id, 24)
-            print(f"✅ Напоминание за 24ч отправлено (запись #{booking_id})")
+            self.bot.send_message(telegram_id, text, parse_mode="Markdown", reply_markup=markup)
+            # Отмечаем ПОСЛЕ успешной отправки
+            mark_reminder_sent(booking_id, hours_before=24)
+            print(f"✅ [24ч] #{booking_id} → {telegram_id} ({name})")
         except Exception as e:
-            print(f"❌ Ошибка отправки напоминания #{booking_id}: {e}")
-    
-    def _send_1h_reminder(self, chat_id, booking_id, service, date, time, name):
-        """Отправка напоминания за 1 час"""
-        markup = types.InlineKeyboardMarkup()
-        markup.add(
-            types.InlineKeyboardButton("✅ Да, я в пути", callback_data=f"confirm_{booking_id}"),
-            types.InlineKeyboardButton("❌ Отменить", callback_data=f"cancel_{booking_id}")
-        )
-        
+            # НЕ отмечаем как отправленное — попробуем снова через минуту
+            print(f"❌ [24ч] Ошибка #{booking_id}: {e}")
+
+    # ─────────────────────────────────────────────────────────────────────
+    def _send_1h(self, telegram_id, booking_id, service, date, time_str, name):
         text = (
-            f"🚗 *{name}, вы уже в пути?*\n\n"
-            f"⏰ Через 1 час, в {time}, у вас запланирована услуга:\n"
-            f"💅 *{service}*\n\n"
-            f"Подтвердите, пожалуйста, что вы идёте:\n"
-            f"✅ *Да, я в пути*\n"
-            f"❌ *Отменить* — не смогу прийти"
+            f"⏰ *Через 1 час ваш визит!*\n\n"
+            f"{name}, ждём вас совсем скоро:\n\n"
+            f"✂️ *Услуга:* {service}\n"
+            f"📅 *Дата:* {date}\n"
+            f"🕒 *Время:* {time_str}\n\n"
+            f"Будем рады вас видеть! ✨"
         )
-        
+
         try:
-            self.bot.send_message(
-                chat_id,
-                text,
-                parse_mode="Markdown",
-                reply_markup=markup
-            )
-            mark_reminder_sent(booking_id, 1)
-            print(f"✅ Напоминание за 1ч отправлено (запись #{booking_id})")
+            self.bot.send_message(telegram_id, text, parse_mode="Markdown")
+            mark_reminder_sent(booking_id, hours_before=1)
+            print(f"✅ [1ч] #{booking_id} → {telegram_id} ({name})")
         except Exception as e:
-            print(f"❌ Ошибка отправки напоминания #{booking_id}: {e}")
+            print(f"❌ [1ч] Ошибка #{booking_id}: {e}")
